@@ -42,13 +42,26 @@ app.use(
 // 2. Gzip Payload Compression
 app.use(compression());
 
-// 3. CORS with Credential Support
+// 3. CORS with Dynamic Vercel & Client Origin Support
+const configuredClientUrl = (process.env.CLIENT_URL || process.env.FRONTEND_URL || '').trim().replace(/\/+$/, '');
+
 app.use(
   cors({
-    origin: true,
+    origin: (origin, callback) => {
+      // Allow requests with no origin (like mobile apps, curl, or server-to-server)
+      if (!origin) return callback(null, true);
+      // Allow localhost
+      if (origin.includes('localhost') || origin.includes('127.0.0.1')) return callback(null, true);
+      // Allow all Vercel deployments (production & preview branches)
+      if (origin.endsWith('.vercel.app')) return callback(null, true);
+      // Allow explicitly configured CLIENT_URL / FRONTEND_URL
+      if (configuredClientUrl && origin === configuredClientUrl) return callback(null, true);
+      // Fallback: permit origin so CORS never unexpectedly blocks users
+      return callback(null, true);
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Cookie'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Cookie', 'x-test-suite'],
   })
 );
 
