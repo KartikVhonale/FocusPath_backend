@@ -38,7 +38,7 @@ const requireTeacher = (req, res, next) => {
  * 1. Generate Teacher Invite Code (Permanent once created)
  * POST /api/teacher/generate-code
  */
-router.post('/generate-code', protect, requireTeacher, async (req, res) => {
+router.post('/generate-code', protect, requireTeacher, async (req, res, next) => {
   try {
     const teacher = await User.findById(req.user._id);
     if (!teacher) {
@@ -76,10 +76,7 @@ router.post('/generate-code', protect, requireTeacher, async (req, res) => {
       isPermanent: true,
     });
   } catch (error) {
-    console.error('Error generating teacher code:', error);
-    res
-      .status(500)
-      .json({ success: false, message: 'Failed to generate invite code', error: error.message });
+    next(error);
   }
 });
 
@@ -87,7 +84,7 @@ router.post('/generate-code', protect, requireTeacher, async (req, res) => {
  * 1b. Create New Classroom with Unique 6-character Alphanumeric Class Code
  * POST /api/teacher/create-class
  */
-router.post('/create-class', protect, requireTeacher, async (req, res) => {
+router.post('/create-class', protect, requireTeacher, async (req, res, next) => {
   try {
     const { name, examId, activeExamId, description } = req.body;
 
@@ -128,10 +125,7 @@ router.post('/create-class', protect, requireTeacher, async (req, res) => {
       message: `🎉 Classroom "${classroom.name}" created with code ${classCode}!`,
     });
   } catch (error) {
-    console.error('Error creating classroom:', error);
-    res
-      .status(500)
-      .json({ success: false, message: 'Failed to create classroom', error: error.message });
+    next(error);
   }
 });
 
@@ -139,7 +133,7 @@ router.post('/create-class', protect, requireTeacher, async (req, res) => {
  * 1c. Fetch Teacher's Classrooms with Detailed Student Rosters
  * GET /api/teacher/classrooms (and alias /classes)
  */
-const getClassroomsHandler = async (req, res) => {
+const getClassroomsHandler = async (req, res, next) => {
   try {
     const classrooms = await Classroom.find({ teacherId: req.user._id })
       .populate('activeExamId', 'name code totalChapters')
@@ -261,10 +255,7 @@ const getClassroomsHandler = async (req, res) => {
       totalCount: enrichedClassrooms.length,
     });
   } catch (error) {
-    console.error('Error fetching classrooms:', error);
-    res
-      .status(500)
-      .json({ success: false, message: 'Failed to fetch classrooms', error: error.message });
+    next(error);
   }
 };
 
@@ -277,7 +268,7 @@ router.get('/classes', protect, requireTeacher, getClassroomsHandler);
  * Pushes exam template, target date, study days, and syllabus tree to all linked students in one batch,
  * setting isLockedByTeacher: true on those plans.
  */
-router.post('/assign-plan', protect, requireTeacher, async (req, res) => {
+router.post('/assign-plan', protect, requireTeacher, async (req, res, next) => {
   try {
     const { examId, targetDate, studyDays, selectedSubjects, instructorNotes } = req.body;
 
@@ -374,12 +365,7 @@ router.post('/assign-plan', protect, requireTeacher, async (req, res) => {
       totalTopics,
     });
   } catch (error) {
-    console.error('Error assigning master plan:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to assign master study plan',
-      error: error.message,
-    });
+    next(error);
   }
 });
 
@@ -388,7 +374,7 @@ router.post('/assign-plan', protect, requireTeacher, async (req, res) => {
  * POST /api/teacher/push-syllabus-update
  * Accepts: { classCode, examId }
  */
-router.post('/push-syllabus-update', protect, requireTeacher, async (req, res) => {
+router.post('/push-syllabus-update', protect, requireTeacher, async (req, res, next) => {
   try {
     const { classCode, examId } = req.body;
     let query = { assignedTeacherId: req.user._id, accountMode: 'managed' };
@@ -496,10 +482,7 @@ router.post('/push-syllabus-update', protect, requireTeacher, async (req, res) =
       syncedCount,
     });
   } catch (error) {
-    console.error('Error pushing syllabus update:', error);
-    res
-      .status(500)
-      .json({ success: false, message: 'Failed to push syllabus update', error: error.message });
+    next(error);
   }
 });
 
@@ -507,7 +490,7 @@ router.post('/push-syllabus-update', protect, requireTeacher, async (req, res) =
  * 3. Update Cohort Instructor Notes & Guidance
  * POST /api/teacher/update-notes
  */
-router.post('/update-notes', protect, requireTeacher, async (req, res) => {
+router.post('/update-notes', protect, requireTeacher, async (req, res, next) => {
   try {
     const { notes } = req.body;
     const cleanNotes = (notes || '').trim();
@@ -526,10 +509,7 @@ router.post('/update-notes', protect, requireTeacher, async (req, res) => {
       cohortNotes: cleanNotes,
     });
   } catch (error) {
-    console.error('Error updating cohort notes:', error);
-    res
-      .status(500)
-      .json({ success: false, message: 'Failed to update cohort notes', error: error.message });
+    next(error);
   }
 });
 
@@ -537,7 +517,7 @@ router.post('/update-notes', protect, requireTeacher, async (req, res) => {
  * 4. Get Roster of Enrolled Students with Live Performance
  * GET /api/teacher/students
  */
-router.get('/students', protect, requireTeacher, async (req, res) => {
+router.get('/students', protect, requireTeacher, async (req, res, next) => {
   try {
     const students = await User.find({
       assignedTeacherId: req.user._id,
@@ -646,10 +626,7 @@ router.get('/students', protect, requireTeacher, async (req, res) => {
       totalCount: studentRoster.length,
     });
   } catch (error) {
-    console.error('Error fetching student roster:', error);
-    res
-      .status(500)
-      .json({ success: false, message: 'Failed to fetch student roster', error: error.message });
+    next(error);
   }
 });
 
@@ -657,7 +634,7 @@ router.get('/students', protect, requireTeacher, async (req, res) => {
  * 5. Teacher Overview Stats
  * GET /api/teacher/overview
  */
-router.get('/overview', protect, requireTeacher, async (req, res) => {
+router.get('/overview', protect, requireTeacher, async (req, res, next) => {
   try {
     const studentsCount = await User.countDocuments({
       assignedTeacherId: req.user._id,
@@ -689,10 +666,7 @@ router.get('/overview', protect, requireTeacher, async (req, res) => {
       cohortAveragePercent,
     });
   } catch (error) {
-    console.error('Error fetching teacher overview:', error);
-    res
-      .status(500)
-      .json({ success: false, message: 'Failed to fetch overview', error: error.message });
+    next(error);
   }
 });
 
@@ -700,7 +674,7 @@ router.get('/overview', protect, requireTeacher, async (req, res) => {
  * 6. Override Student Daily Target & Directives (Slide-Over Drawer Action)
  * PUT /api/teacher/student/:studentId/override-target
  */
-router.put('/student/:studentId/override-target', protect, requireTeacher, async (req, res) => {
+router.put('/student/:studentId/override-target', protect, requireTeacher, async (req, res, next) => {
   try {
     const { studentId } = req.params;
     const { target, notes } = req.body;
@@ -719,35 +693,47 @@ router.put('/student/:studentId/override-target', protect, requireTeacher, async
       return res.status(404).json({ success: false, message: 'No active study plan for student' });
     }
 
+    let planUpdate = {};
     if (notes !== undefined) {
-      plan.instructorNotes = String(notes || '').trim();
+      planUpdate.$set = { instructorNotes: String(notes || '').trim() };
     }
 
     const todayStr = getTodayDateString();
-    let todayLog = await DailyLog.findOne({
-      userId: studentId,
-      studyPlanId: plan._id,
-      date: todayStr,
-    });
-
-    if (!todayLog) {
-      todayLog = new DailyLog({
-        userId: studentId,
-        studyPlanId: plan._id,
-        date: todayStr,
-        topicsCompleted: 0,
-        timeStudiedMinutes: 0,
-        targetForDay: Number(target) || 0,
-      });
-    } else if (target !== undefined) {
-      todayLog.targetForDay = Number(target);
+    
+    let logUpdate = {};
+    if (target !== undefined) {
+      logUpdate.$set = { targetForDay: Number(target) || 0 };
     }
-
     if (notes !== undefined) {
-      todayLog.notes = String(notes || '').trim();
+      logUpdate.$set = { ...logUpdate.$set, notes: String(notes || '').trim() };
     }
 
-    await Promise.all([plan.save(), todayLog.save()]);
+    const mongoose = (await import('mongoose')).default;
+    const dbSession = await mongoose.startSession();
+    dbSession.startTransaction();
+
+    let updatedLog;
+    try {
+      if (Object.keys(planUpdate).length > 0) {
+        await StudyPlan.findByIdAndUpdate(plan._id, planUpdate, { session: dbSession });
+      }
+
+      updatedLog = await DailyLog.findOneAndUpdate(
+        { userId: studentId, studyPlanId: plan._id, date: todayStr },
+        { 
+          $set: logUpdate.$set,
+          $setOnInsert: { topicsCompleted: 0, timeStudiedMinutes: 0 }
+        },
+        { upsert: true, new: true, session: dbSession }
+      );
+
+      await dbSession.commitTransaction();
+      dbSession.endSession();
+    } catch (txError) {
+      await dbSession.abortTransaction();
+      dbSession.endSession();
+      throw txError;
+    }
 
     // Invalidate cached target for student
     delCache(`target:${studentId}:${todayStr}`);
@@ -755,14 +741,11 @@ router.put('/student/:studentId/override-target', protect, requireTeacher, async
     res.json({
       success: true,
       message: 'Student target & directive updated successfully',
-      target: todayLog.targetForDay,
-      notes: plan.instructorNotes,
+      target: updatedLog.targetForDay,
+      notes: notes !== undefined ? String(notes || '').trim() : plan.instructorNotes,
     });
   } catch (error) {
-    console.error('Error overriding student target:', error);
-    res
-      .status(500)
-      .json({ success: false, message: 'Failed to update student target', error: error.message });
+    next(error);
   }
 });
 
@@ -770,7 +753,7 @@ router.put('/student/:studentId/override-target', protect, requireTeacher, async
  * 7. Student Profile Deep Analytics
  * GET /api/teacher/student-profile/:studentId
  */
-router.get('/student-profile/:studentId', protect, requireTeacher, async (req, res) => {
+router.get('/student-profile/:studentId', protect, requireTeacher, async (req, res, next) => {
   try {
     const { studentId } = req.params;
 
@@ -877,10 +860,7 @@ router.get('/student-profile/:studentId', protect, requireTeacher, async (req, r
       distribution,
     });
   } catch (error) {
-    console.error('Error fetching student profile:', error);
-    res
-      .status(500)
-      .json({ success: false, message: 'Failed to fetch student profile', error: error.message });
+    next(error);
   }
 });
 
@@ -888,7 +868,7 @@ router.get('/student-profile/:studentId', protect, requireTeacher, async (req, r
  * 8. Real-Time Cohort Activity Feed
  * GET /api/teacher/activity-feed
  */
-router.get('/activity-feed', protect, requireTeacher, async (req, res) => {
+router.get('/activity-feed', protect, requireTeacher, async (req, res, next) => {
   try {
     const students = await User.find({
       assignedTeacherId: req.user._id,
@@ -945,10 +925,7 @@ router.get('/activity-feed', protect, requireTeacher, async (req, res) => {
       activities,
     });
   } catch (error) {
-    console.error('Error fetching activity feed:', error);
-    res
-      .status(500)
-      .json({ success: false, message: 'Failed to fetch activity feed', error: error.message });
+    next(error);
   }
 });
 
@@ -956,7 +933,7 @@ router.get('/activity-feed', protect, requireTeacher, async (req, res) => {
  * 9. Cohort Telemetry: Bottleneck Topics
  * GET /api/teacher/cohort-telemetry
  */
-router.get('/cohort-telemetry', protect, requireTeacher, async (req, res) => {
+router.get('/cohort-telemetry', protect, requireTeacher, async (req, res, next) => {
   try {
     const students = await User.find({
       assignedTeacherId: req.user._id,
@@ -1041,12 +1018,7 @@ router.get('/cohort-telemetry', protect, requireTeacher, async (req, res) => {
       totalEnrolled,
     });
   } catch (error) {
-    console.error('Error fetching cohort telemetry:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to analyze cohort telemetry',
-      error: error.message,
-    });
+    next(error);
   }
 });
 

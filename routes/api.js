@@ -1,4 +1,5 @@
 import express from 'express';
+import mongoose from 'mongoose';
 import NodeCache from 'node-cache';
 import Exam from '../models/Exam.js';
 import User from '../models/User.js';
@@ -143,19 +144,28 @@ router.get('/exams/:id', async (req, res, next) => {
 router.post('/study-plan', optionalAuth, async (req, res, next) => {
   try {
     const { examId, targetDate, studyDays, selectedSubjects } = req.body;
+
+    // --- Input Validation (before any DB call) ---
+    if (!examId || !String(examId).trim()) {
+      return res.status(400).json({ success: false, error: 'examId is required.', code: 400 });
+    }
+    if (!targetDate) {
+      return res.status(400).json({ success: false, error: 'targetDate is required.', code: 400 });
+    }
+    const parsedDate = new Date(targetDate);
+    if (isNaN(parsedDate.getTime()) || parsedDate <= new Date()) {
+      return res.status(400).json({ success: false, error: 'targetDate must be a valid future date.', code: 400 });
+    }
+
     const user = await resolveUser(req);
 
     if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found' });
+      return res.status(404).json({ success: false, error: 'User not found', code: 404 });
     }
 
     const exam = await Exam.findById(examId).lean();
     if (!exam) {
-      return res.status(404).json({ success: false, message: 'Selected exam not found' });
-    }
-
-    if (!targetDate) {
-      return res.status(400).json({ success: false, message: 'Target date is required' });
+      return res.status(404).json({ success: false, error: 'Selected exam not found', code: 404 });
     }
 
     // Senior Architect Feature: Calculate total topics based on user's selected subjects
@@ -181,32 +191,42 @@ router.post('/study-plan', optionalAuth, async (req, res, next) => {
       totalTopics = leafNodesCount;
     }
 
-    let plan = await StudyPlan.findOne({ userId: user._id, status: 'active' });
+    let plan;
+    const existingPlan = await StudyPlan.findOne({ userId: user._id, status: 'active' }).lean();
 
-    if (plan) {
-      if (plan.isLockedByTeacher && user.accountMode !== 'teacher') {
+    if (existingPlan) {
+      if (existingPlan.isLockedByTeacher && user.accountMode !== 'teacher') {
         return res.status(403).json({
           success: false,
-          message: '🔒 This study plan is managed and locked by your instructor.',
+          error: '🔒 This study plan is managed and locked by your instructor.',
+          code: 403
         });
       }
-      plan.examId = exam._id;
-      plan.targetDate = new Date(targetDate);
-      plan.totalTopics = totalTopics;
-      plan.selectedSubjects = subjectsList;
+
+      const updateData = {
+        $set: {
+          examId: exam._id,
+          targetDate: new Date(targetDate),
+          totalTopics,
+          selectedSubjects: subjectsList,
+        },
+      };
+
       if (
-        !Array.isArray(plan.subjects) ||
-        plan.subjects.length === 0 ||
-        plan.examId.toString() !== examId.toString()
+        !Array.isArray(existingPlan.subjects) ||
+        existingPlan.subjects.length === 0 ||
+        existingPlan.examId.toString() !== examId.toString()
       ) {
-        plan.subjects = clonedSubjects;
-        plan.completedTopics = 0;
-        plan.completedChapterIds = [];
+        updateData.$set.subjects = clonedSubjects;
+        updateData.$set.completedTopics = 0;
+        updateData.$set.completedChapterIds = [];
       }
+      
       if (studyDays && Array.isArray(studyDays)) {
-        plan.studyDays = studyDays;
+        updateData.$set.studyDays = studyDays;
       }
-      await plan.save();
+
+      plan = await StudyPlan.findByIdAndUpdate(existingPlan._id, updateData, { new: true });
     } else {
       plan = await StudyPlan.create({
         userId: user._id,
@@ -965,10 +985,13 @@ router.get('/dashboard', optionalAuth, async (req, res, next) => {
       setCache(cacheKey, calculation, 3600);
     }
 
-    // Save target for today in the log for historical tracking if changed
+    // Atomically persist today's target for historical tracking (only when changed)
     if (todayLog.targetForDay !== calculation.todayTarget) {
+      await DailyLog.findByIdAndUpdate(
+        todayLog._id,
+        { $set: { targetForDay: calculation.todayTarget } }
+      );
       todayLog.targetForDay = calculation.todayTarget;
-      await todayLog.save();
     }
 
     // Query Optimization: Limit to last 7 days of logs + .lean() to prevent massive database reads
@@ -1061,9 +1084,9 @@ router.get('/dashboard', optionalAuth, async (req, res, next) => {
         studyDays: plan.studyDays,
         todayTarget: calculation.todayTarget,
         activeStudyDayPace: calculation.activeStudyDayPace,
-        todayCompleted: todayLog.topicsCompleted,
-        timeStudiedMinutes: todayLog.timeStudiedMinutes,
-        totalCompleted: plan.completedTopics || 0,
+        todayCompleted: Math.max(0, todayLog.topicsCompleted || 0),
+        timeStudiedMinutes: Math.max(0, todayLog.timeStudiedMinutes || 0),
+        totalCompleted: Math.max(0, plan.completedTopics || 0),
         totalTopics: plan.totalTopics,
         remainingTopics: calculation.remainingTopics,
         remainingValidDays: calculation.remainingValidDays,
@@ -1093,7 +1116,7 @@ router.get('/dashboard', optionalAuth, async (req, res, next) => {
         customGoalTitle: calculation.customGoalTitle || '',
         goalUnit: calculation.goalUnit || 'Topics',
         targetQuantity: calculation.targetQuantity || plan.totalTopics,
-        completedQuantity: calculation.completedQuantity || plan.completedTopics || 0,
+        completedQuantity: Math.max(0, calculation.completedQuantity || plan.completedTopics || 0),
         remainingQuantity: calculation.remainingQuantity || calculation.remainingTopics,
         dailyTargetQuantity: calculation.dailyTargetQuantity || calculation.todayTarget,
         isSafeModeExceeded: Boolean(calculation.isSafeModeExceeded),
@@ -1114,170 +1137,153 @@ router.get('/dashboard', optionalAuth, async (req, res, next) => {
  * POST /api/study-plan/toggle-node
  */
 router.post('/study-plan/toggle-node', optionalAuth, async (req, res, next) => {
+  // --- Input Validation ---
+  const { studyPlanId, nodeId, isCompleted, action } = req.body;
+  if (!nodeId) {
+    return res.status(400).json({ success: false, error: 'nodeId is required.', code: 400 });
+  }
+
+  const dbSession = await mongoose.startSession();
+  dbSession.startTransaction();
   try {
-    const { studyPlanId, nodeId, isCompleted, action } = req.body;
     const user = await resolveUser(req);
 
+    // Fetch plan (initial read; writes are atomic below)
     let plan = studyPlanId
       ? await StudyPlan.findById(studyPlanId).populate('examId')
       : await StudyPlan.findOne({ userId: user._id, status: 'active' }).populate('examId');
 
     if (!plan) {
-      return res.status(404).json({ success: false, message: 'Study plan not found' });
+      await dbSession.abortTransaction();
+      dbSession.endSession();
+      return res.status(404).json({ success: false, error: 'Study plan not found', code: 404 });
     }
 
     const todayStr = getTodayDateString();
-    let todayLog = await DailyLog.findOne({
-      userId: user._id,
-      studyPlanId: plan._id,
-      date: todayStr,
-    });
+    const nodeIdStr = String(nodeId);
 
-    if (!todayLog) {
-      todayLog = await DailyLog.create({
-        userId: user._id,
-        studyPlanId: plan._id,
-        date: todayStr,
-        topicsCompleted: 0,
-        timeStudiedMinutes: 0,
-      });
-    }
-
-    if (!Array.isArray(plan.nodeReviews)) {
-      plan.nodeReviews = [];
-    }
-
-    let existingReview = plan.nodeReviews.find((r) => String(r.nodeId) === String(nodeId));
-
-    // Handle Snooze Action (iOS Swipe Left: reveals amber clock, snooze to tomorrow)
-    if (action === 'snooze') {
-      const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000);
-      if (existingReview) {
-        existingReview.nextReviewDate = tomorrow;
-      } else {
-        plan.nodeReviews.push({
-          nodeId: String(nodeId),
-          reviewCount: 1,
-          nextReviewDate: tomorrow,
-          lastReviewedAt: new Date(),
-        });
-      }
-
-      // Also update matching subtopic node in subjects tree if present
-      if (Array.isArray(plan.subjects)) {
-        for (const subj of plan.subjects) {
-          for (const ch of subj.chapters || []) {
-            for (const top of ch.topics || []) {
-              for (const st of top.subtopics || []) {
-                const subId = String(
-                  st.nodeId ||
-                    st._id ||
-                    st.id ||
-                    `${subj.subjectName || subj.name}-${ch.chapterName || ch.title}-${top.title}-${st.title}`
-                );
-                if (subId === String(nodeId)) {
-                  st.nextReviewDate = tomorrow;
-                }
-              }
-            }
-          }
-        }
-      }
-
-      await plan.save();
-      delCache(`target:${user._id}:${todayStr}`);
-
-      return res.json({
-        success: true,
-        message: 'Topic snoozed to tomorrow',
-        snoozed: true,
-        nextReviewDate: tomorrow,
-      });
-    }
-
-    // SRS Multiplier Algorithm (iOS Swipe Right: marks complete / review)
-    // 1st time: 3 days. 2nd time: 7 days. 3rd+ time: 21 days.
+    // SRS Multiplier Algorithm: 1st=3d, 2nd=7d, 3rd+=21d
+    const existingReview = (plan.nodeReviews || []).find((r) => String(r.nodeId) === nodeIdStr);
     const isFirstTime = !existingReview || existingReview.reviewCount === 0;
-    let nextReviewDays = 3;
-
-    if (!isFirstTime) {
-      if (existingReview.reviewCount === 1) {
-        nextReviewDays = 7;
-      } else {
-        nextReviewDays = 21;
-      }
-    }
-
+    const nextReviewDays = isFirstTime ? 3 : existingReview.reviewCount === 1 ? 7 : 21;
     const nextDate = new Date(Date.now() + nextReviewDays * 24 * 60 * 60 * 1000);
     const newCount = isFirstTime ? 1 : existingReview.reviewCount + 1;
 
-    if (existingReview) {
-      existingReview.reviewCount = newCount;
-      existingReview.nextReviewDate = nextDate;
-      existingReview.lastReviewedAt = new Date();
-    } else {
-      plan.nodeReviews.push({
-        nodeId: String(nodeId),
-        reviewCount: newCount,
-        nextReviewDate: nextDate,
-        lastReviewedAt: new Date(),
+    // Handle Snooze Action (iOS Swipe Left: snooze to tomorrow)
+    if (action === 'snooze') {
+      const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      const snoozeExists = (plan.nodeReviews || []).some((r) => String(r.nodeId) === nodeIdStr);
+      if (snoozeExists) {
+        await StudyPlan.findOneAndUpdate(
+          { _id: plan._id, 'nodeReviews.nodeId': nodeIdStr },
+          { $set: { 'nodeReviews.$.nextReviewDate': tomorrow } },
+          { session: dbSession }
+        );
+      } else {
+        await StudyPlan.findByIdAndUpdate(
+          plan._id,
+          { $push: { nodeReviews: { nodeId: nodeIdStr, reviewCount: 1, nextReviewDate: tomorrow, lastReviewedAt: new Date() } } },
+          { session: dbSession }
+        );
+      }
+      await dbSession.commitTransaction();
+      dbSession.endSession();
+      delCache(`target:${user._id}:${todayStr}`);
+      return res.json({ success: true, message: 'Topic snoozed to tomorrow', snoozed: true, nextReviewDate: tomorrow });
+    }
+
+    const isUndo = isCompleted === false || action === 'undo';
+
+    if (isUndo) {
+      // Fetch current log to clamp topicsCompleted at 0
+      const currentLog = await DailyLog.findOne({
+        userId: user._id,
+        studyPlanId: plan._id,
+        date: todayStr,
+      }).session(dbSession);
+
+      const newTopicsCompleted = Math.max(0, (currentLog?.topicsCompleted || 0) - 1);
+      const newPlanCompleted = Math.max(0, (plan.completedTopics || 0) - 1);
+
+      await Promise.all([
+        StudyPlan.findByIdAndUpdate(
+          plan._id,
+          {
+            $pull: { completedChapterIds: nodeIdStr, nodeReviews: { nodeId: nodeIdStr } },
+            $set: { completedTopics: newPlanCompleted },
+          },
+          { session: dbSession }
+        ),
+        DailyLog.findOneAndUpdate(
+          { userId: user._id, studyPlanId: plan._id, date: todayStr },
+          {
+            $set: { topicsCompleted: newTopicsCompleted },
+            $pull: { completedTopicIds: nodeIdStr },
+          },
+          { upsert: true, session: dbSession }
+        ),
+      ]);
+
+      await dbSession.commitTransaction();
+      dbSession.endSession();
+      delCache(`target:${user._id}:${todayStr}`);
+
+      const freshPlan = await StudyPlan.findById(plan._id).populate('examId').lean();
+      const reviewQueue = getReviewQueue(freshPlan, freshPlan.examId, 5);
+      const upNextQueue = getUpNextQueue(freshPlan, freshPlan.examId, 3);
+
+      return res.json({
+        success: true,
+        message: 'Task restored to queue.',
+        reviewQueue,
+        upNextQueue,
+        todayCompleted: newTopicsCompleted,
+        totalCompleted: newPlanCompleted,
       });
     }
 
-    // Also update matching subtopic node in 4-level deep subjects array if present
-    if (Array.isArray(plan.subjects)) {
-      for (const subj of plan.subjects) {
-        for (const ch of subj.chapters || []) {
-          for (const top of ch.topics || []) {
-            for (const st of top.subtopics || []) {
-              const subId = String(
-                st.nodeId ||
-                  st._id ||
-                  st.id ||
-                  `${subj.subjectName || subj.name}-${ch.chapterName || ch.title}-${top.title}-${st.title}`
-              );
-              if (subId === String(nodeId)) {
-                if (isCompleted === false) {
-                  st.isCompleted = false;
-                } else {
-                  st.isCompleted = true;
-                  st.reviewCount = newCount;
-                  st.nextReviewDate = nextDate;
-                  st.lastReviewedAt = new Date();
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-    if (isCompleted === false && action !== 'snooze') {
-      plan.completedChapterIds = plan.completedChapterIds.filter((id) => id !== String(nodeId));
-      plan.completedTopics = Math.max(0, (plan.completedTopics || 0) - 1);
-      todayLog.topicsCompleted = Math.max(0, (todayLog.topicsCompleted || 0) - 1);
-      todayLog.completedTopicIds = (todayLog.completedTopicIds || []).filter(
-        (id) => id !== String(nodeId)
+    // --- Complete Action: Advance SRS and mark completed ---
+    const reviewExists = (plan.nodeReviews || []).some((r) => String(r.nodeId) === nodeIdStr);
+    if (reviewExists) {
+      await StudyPlan.findOneAndUpdate(
+        { _id: plan._id, 'nodeReviews.nodeId': nodeIdStr },
+        { $set: { 'nodeReviews.$.reviewCount': newCount, 'nodeReviews.$.nextReviewDate': nextDate, 'nodeReviews.$.lastReviewedAt': new Date() } },
+        { session: dbSession }
       );
-      await todayLog.save();
-    } else if (!plan.completedChapterIds.includes(String(nodeId)) && action !== 'snooze') {
-      plan.completedChapterIds.push(String(nodeId));
-      plan.completedTopics = Math.min(plan.totalTopics, (plan.completedTopics || 0) + 1);
-      todayLog.topicsCompleted = (todayLog.topicsCompleted || 0) + 1;
-      if (!Array.isArray(todayLog.completedTopicIds)) todayLog.completedTopicIds = [];
-      if (!todayLog.completedTopicIds.includes(String(nodeId))) {
-        todayLog.completedTopicIds.push(String(nodeId));
-      }
-      await todayLog.save();
+    } else {
+      await StudyPlan.findByIdAndUpdate(
+        plan._id,
+        { $push: { nodeReviews: { nodeId: nodeIdStr, reviewCount: newCount, nextReviewDate: nextDate, lastReviewedAt: new Date() } } },
+        { session: dbSession }
+      );
     }
 
-    await plan.save();
+    if (!plan.completedChapterIds.includes(nodeIdStr)) {
+      await Promise.all([
+        StudyPlan.findByIdAndUpdate(
+          plan._id,
+          { $addToSet: { completedChapterIds: nodeIdStr }, $inc: { completedTopics: 1 } },
+          { session: dbSession }
+        ),
+        DailyLog.findOneAndUpdate(
+          { userId: user._id, studyPlanId: plan._id, date: todayStr },
+          { $inc: { topicsCompleted: 1 }, $addToSet: { completedTopicIds: nodeIdStr } },
+          { upsert: true, session: dbSession }
+        ),
+      ]);
+    }
 
-    // Invalidate target cache and recalculate
+    // Commit both collection writes atomically
+    await dbSession.commitTransaction();
+    dbSession.endSession();
+
     delCache(`target:${user._id}:${todayStr}`);
 
-    const reviewQueue = getReviewQueue(plan, plan.examId, 5);
-    const upNextQueue = getUpNextQueue(plan, plan.examId, 3);
+    // Post-commit read for fresh queue data (reads don't need session)
+    const freshPlan = await StudyPlan.findById(plan._id).populate('examId').lean();
+    const freshLog = await DailyLog.findOne({ userId: user._id, studyPlanId: plan._id, date: todayStr }).lean();
+    const reviewQueue = getReviewQueue(freshPlan, freshPlan.examId, 5);
+    const upNextQueue = getUpNextQueue(freshPlan, freshPlan.examId, 3);
 
     res.json({
       success: true,
@@ -1288,9 +1294,12 @@ router.post('/study-plan/toggle-node', optionalAuth, async (req, res, next) => {
       nextReviewDate: nextDate,
       reviewQueue,
       upNextQueue,
-      todayCompleted: todayLog.topicsCompleted,
+      todayCompleted: Math.max(0, freshLog?.topicsCompleted || 0),
+      totalCompleted: Math.max(0, freshPlan?.completedTopics || 0),
     });
   } catch (error) {
+    await dbSession.abortTransaction();
+    dbSession.endSession();
     next(error);
   }
 });
@@ -1303,8 +1312,8 @@ router.post('/study-plan/toggle-node', optionalAuth, async (req, res, next) => {
 const completeChapterHandler = async (req, res, next) => {
   try {
     const { chapterId } = req.body;
-    if (!chapterId) {
-      return res.status(400).json({ success: false, message: 'chapterId is required' });
+    if (!chapterId || !String(chapterId).trim()) {
+      return res.status(400).json({ success: false, error: 'chapterId is required.', code: 400 });
     }
 
     const user = await resolveUser(req);
@@ -1313,7 +1322,7 @@ const completeChapterHandler = async (req, res, next) => {
       status: { $in: ['active', 'paused'] },
     });
     if (!plan) {
-      return res.status(404).json({ success: false, message: 'Active study plan not found' });
+      return res.status(404).json({ success: false, error: 'Active study plan not found.', code: 404 });
     }
 
     const todayStr = getTodayDateString();
@@ -1394,54 +1403,48 @@ const completeChapterHandler = async (req, res, next) => {
       completedLeafIds.push(String(chapterId));
     }
 
-    // Sync plan.completedChapterIds
-    const completedSet = new Set((plan.completedChapterIds || []).map(String));
-    completedLeafIds.forEach((id) => completedSet.add(id));
-    plan.completedChapterIds = Array.from(completedSet);
-    plan.completedTopics = plan.completedChapterIds.length;
+    // --- ACID Transaction: Atomically sync StudyPlan + DailyLog ---
+    const dbSession = await mongoose.startSession();
+    dbSession.startTransaction();
+    try {
+      // Atomic: push all completed leaf IDs into StudyPlan.completedChapterIds with $addToSet
+      const newCompletedTopicsCount = (plan.completedChapterIds || []).length + completedLeafIds.length;
+      await StudyPlan.findByIdAndUpdate(
+        plan._id,
+        {
+          $addToSet: { completedChapterIds: { $each: completedLeafIds } },
+          $set: { completedTopics: newCompletedTopicsCount },
+          $push: {
+            nodeReviews: {
+              $each: completedLeafIds.map((nodeId) => ({
+                nodeId,
+                reviewCount: 1,
+                nextReviewDate: srsNextReview,
+                lastReviewedAt: todayDate,
+              })),
+            },
+          },
+        },
+        { session: dbSession }
+      );
 
-    // Sync nodeReviews
-    completedLeafIds.forEach((nodeId) => {
-      const existing = (plan.nodeReviews || []).find((r) => String(r.nodeId) === nodeId);
-      if (existing) {
-        existing.reviewCount = (existing.reviewCount || 0) + 1;
-        existing.lastReviewedAt = todayDate;
-        existing.nextReviewDate = srsNextReview;
-      } else {
-        plan.nodeReviews.push({
-          nodeId,
-          reviewCount: 1,
-          nextReviewDate: srsNextReview,
-          lastReviewedAt: todayDate,
-        });
-      }
-    });
+      // Atomic: push all completed leaf IDs into today's DailyLog
+      await DailyLog.findOneAndUpdate(
+        { userId: user._id, studyPlanId: plan._id, date: todayStr },
+        {
+          $addToSet: { completedTopicIds: { $each: completedLeafIds } },
+          $inc: { topicsCompleted: completedLeafIds.length },
+        },
+        { upsert: true, session: dbSession }
+      );
 
-    // Sync today's DailyLog
-    let todayLog = await DailyLog.findOne({
-      userId: user._id,
-      studyPlanId: plan._id,
-      date: todayStr,
-    });
-    if (!todayLog) {
-      todayLog = new DailyLog({
-        userId: user._id,
-        studyPlanId: plan._id,
-        date: todayStr,
-        topicsCompleted: 0,
-        completedTopicIds: [],
-        timeStudiedMinutes: 0,
-        totalTimeStudiedMinutes: 0,
-      });
+      await dbSession.commitTransaction();
+      dbSession.endSession();
+    } catch (txError) {
+      await dbSession.abortTransaction();
+      dbSession.endSession();
+      throw txError;
     }
-
-    const todayCompletedSet = new Set((todayLog.completedTopicIds || []).map(String));
-    completedLeafIds.forEach((id) => todayCompletedSet.add(id));
-    todayLog.completedTopicIds = Array.from(todayCompletedSet);
-    todayLog.topicsCompleted = todayLog.completedTopicIds.length;
-
-    await plan.save();
-    await todayLog.save();
 
     delCache(`target:${user._id}:${todayStr}`);
 
@@ -1450,7 +1453,7 @@ const completeChapterHandler = async (req, res, next) => {
       message: `🎉 Successfully completed entire section (${completedLeafIds.length} subtopics)!`,
       completedCount: completedLeafIds.length,
       completedLeafIds,
-      totalCompleted: plan.completedTopics,
+      totalCompleted: (plan.completedChapterIds || []).length + completedLeafIds.length,
     });
   } catch (error) {
     next(error);
@@ -1468,13 +1471,12 @@ router.post('/complete-chapter', optionalAuth, completeChapterHandler);
  * - Appends session data into today's DailyLog.sessions array and increments totalTimeStudiedMinutes
  */
 const logTimeHandler = async (req, res, next) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
   try {
     const {
       studyPlanId,
       topicId,
       durationMinutes,
+      duration: durationAlt,
       topicTitle,
       subjectName,
       chapterName,
@@ -1486,13 +1488,25 @@ const logTimeHandler = async (req, res, next) => {
       timeRange,
     } = req.body;
     
-    if (!topicId || !durationMinutes) {
-      throw new Error('topicId and durationMinutes are required and must be valid.');
+    if (!topicId || !String(topicId).trim()) {
+      return res.status(400).json({ success: false, error: 'topicId is required and must be a non-empty string.', code: 400 });
     }
-    const duration = Math.max(1, Math.round(Number(durationMinutes) || 0));
-    const user = await resolveUser(req);
+    const rawDuration = durationMinutes !== undefined ? durationMinutes : durationAlt;
+    const parsedDuration = Number(rawDuration);
+    if (rawDuration === undefined || rawDuration === null || !isFinite(parsedDuration) || parsedDuration <= 0) {
+      return res.status(400).json({ success: false, error: 'duration is required and must be a positive number greater than 0.', code: 400 });
+    }
+    const duration = Math.round(parsedDuration);
 
-    // 1. Fetch Plan to verify existence and get _id
+    const user = await resolveUser(req);
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found.', code: 404 });
+    }
+
+    const session = await mongoose.startSession();
+    session.startTransaction();
+    try {
+      // 1. Fetch Plan to verify existence and get _id
     let plan = studyPlanId
       ? await StudyPlan.findById(studyPlanId).session(session)
       : await StudyPlan.findOne({ userId: user._id, status: 'active' }).session(session);
@@ -1565,21 +1579,22 @@ const logTimeHandler = async (req, res, next) => {
       );
     }
 
-    await session.commitTransaction();
-    session.endSession();
+      await session.commitTransaction();
+      session.endSession();
 
-    delCache(`target:${user._id}:${todayStr}`);
+      delCache(`target:${user._id}:${todayStr}`);
 
-    res.json({
-      success: true,
-      message: `Recorded ${duration} minutes on "${topicTitle || topicId}"!`,
-      session: newSession,
-    });
+      return res.json({
+        success: true,
+        message: `Recorded ${duration} minutes on "${topicTitle || topicId}"!`,
+        session: newSession,
+      });
+    } catch (txError) {
+      await session.abortTransaction();
+      session.endSession();
+      throw txError;
+    }
   } catch (error) {
-    await session.abortTransaction();
-    session.endSession();
-    // Pass to global error handler
-    error.status = error.message.includes('required') || error.message.includes('found') ? 400 : 500;
     next(error);
   }
 };
@@ -1613,13 +1628,10 @@ const joinClassHandler = async (req, res, next) => {
         .json({ success: false, message: 'Invalid class code. Classroom not found.' });
     }
 
-    // Add student to classroom students array if not already present
-    const studentIdStr = user._id.toString();
-    const alreadyEnrolled = (classroom.students || []).some((s) => s.toString() === studentIdStr);
-    if (!alreadyEnrolled) {
-      classroom.students.push(user._id);
-      await classroom.save();
-    }
+    // Add student to classroom students array atomically
+    await Classroom.findByIdAndUpdate(classroom._id, {
+      $addToSet: { students: user._id }
+    });
 
     // Update student's user account mode to managed and link assignedTeacherId
     await User.findByIdAndUpdate(user._id, {
@@ -1628,7 +1640,7 @@ const joinClassHandler = async (req, res, next) => {
     });
 
     // If classroom has an active exam, synchronize student's active plan
-    let activePlan = await StudyPlan.findOne({ userId: user._id, status: 'active' });
+    let activePlan = await StudyPlan.findOne({ userId: user._id, status: 'active' }).lean();
     if (classroom.activeExamId) {
       const exam = classroom.activeExamId;
       const targetDate = new Date();
@@ -1650,14 +1662,20 @@ const joinClassHandler = async (req, res, next) => {
           status: 'active',
         });
       } else {
-        activePlan.isLockedByTeacher = true;
-        activePlan.assignedTeacherId = classroom.teacherId._id || classroom.teacherId;
-        await activePlan.save();
+        await StudyPlan.findByIdAndUpdate(activePlan._id, {
+          $set: {
+            isLockedByTeacher: true,
+            assignedTeacherId: classroom.teacherId._id || classroom.teacherId,
+          }
+        });
       }
     } else if (activePlan) {
-      activePlan.isLockedByTeacher = true;
-      activePlan.assignedTeacherId = classroom.teacherId._id || classroom.teacherId;
-      await activePlan.save();
+      await StudyPlan.findByIdAndUpdate(activePlan._id, {
+        $set: {
+          isLockedByTeacher: true,
+          assignedTeacherId: classroom.teacherId._id || classroom.teacherId,
+        }
+      });
     }
 
     res.json({
@@ -1689,12 +1707,12 @@ const addCustomTopicHandler = async (req, res, next) => {
     const { parentId, level = 'subtopic', title, subjectName, chapterName, topicTitle } = req.body;
 
     if (!title || !title.trim()) {
-      return res.status(400).json({ success: false, message: 'Topic title is required.' });
+      return res.status(400).json({ success: false, error: 'Topic title is required.', code: 400 });
     }
 
     const plan = await StudyPlan.findOne({ userId: user._id, status: 'active' }).populate('examId');
     if (!plan) {
-      return res.status(404).json({ success: false, message: 'Active study plan not found.' });
+      return res.status(404).json({ success: false, error: 'Active study plan not found.', code: 404 });
     }
 
     const isPersonalSubtopic = Boolean(req.body.isPersonal);
@@ -1817,7 +1835,13 @@ const addCustomTopicHandler = async (req, res, next) => {
 
     plan.totalTopics = countLeafNodes(plan.subjects, plan.isLockedByTeacher);
     delCache(`target:${user._id}:${getTodayDateString()}`);
-    await plan.save();
+    
+    await StudyPlan.findByIdAndUpdate(plan._id, {
+      $set: {
+        subjects: plan.subjects,
+        totalTopics: plan.totalTopics
+      }
+    });
 
     res.status(201).json({
       success: true,
@@ -1853,12 +1877,12 @@ const removeTopicHandler = async (req, res, next) => {
     if (!nodeId) {
       return res
         .status(400)
-        .json({ success: false, message: 'Node ID or Title is required to delete.' });
+        .json({ success: false, error: 'Node ID or Title is required to delete.', code: 400 });
     }
 
     const plan = await StudyPlan.findOne({ userId: user._id, status: 'active' }).populate('examId');
     if (!plan) {
-      return res.status(404).json({ success: false, message: 'Active study plan not found.' });
+      return res.status(404).json({ success: false, error: 'Active study plan not found.', code: 404 });
     }
 
     if (plan.isLockedByTeacher && user.accountMode !== 'teacher') {
@@ -1923,7 +1947,16 @@ const removeTopicHandler = async (req, res, next) => {
     plan.totalTopics = countLeafNodes(plan.subjects);
     plan.completedTopics = countCompletedLeafNodes(plan);
     delCache(`target:${user._id}:${getTodayDateString()}`);
-    await plan.save();
+    
+    await StudyPlan.findByIdAndUpdate(plan._id, {
+      $set: {
+        subjects: plan.subjects,
+        completedChapterIds: plan.completedChapterIds,
+        nodeReviews: plan.nodeReviews,
+        totalTopics: plan.totalTopics,
+        completedTopics: plan.completedTopics
+      }
+    });
 
     res.json({
       success: true,
@@ -1951,17 +1984,17 @@ const renameTopicHandler = async (req, res, next) => {
     const cleanTitle = (newTitle || title || '').trim();
 
     if (!cleanTitle) {
-      return res.status(400).json({ success: false, message: 'New title cannot be empty.' });
+      return res.status(400).json({ success: false, error: 'New title cannot be empty.', code: 400 });
     }
 
-    const targetIdStr = String(nodeId || id);
-    if (!targetIdStr) {
-      return res.status(400).json({ success: false, message: 'Node identifier is required.' });
+    const targetIdStr = String(nodeId || id || '');
+    if (!targetIdStr.trim()) {
+      return res.status(400).json({ success: false, error: 'Node identifier is required.', code: 400 });
     }
 
     const plan = await StudyPlan.findOne({ userId: user._id, status: 'active' }).populate('examId');
     if (!plan) {
-      return res.status(404).json({ success: false, message: 'Active study plan not found.' });
+      return res.status(404).json({ success: false, error: 'Active study plan not found.', code: 404 });
     }
 
     if (plan.isLockedByTeacher && user.accountMode !== 'teacher') {
@@ -2011,14 +2044,12 @@ const renameTopicHandler = async (req, res, next) => {
       if (renamed) break;
     }
 
-    // Also update title in nodeReviews if present
-    for (const review of plan.nodeReviews || []) {
-      if (String(review.nodeId) === targetIdStr) {
-        review.title = cleanTitle;
+    await StudyPlan.findByIdAndUpdate(plan._id, {
+      $set: {
+        subjects: plan.subjects,
+        nodeReviews: plan.nodeReviews
       }
-    }
-
-    await plan.save();
+    });
 
     res.json({
       success: true,
@@ -2046,12 +2077,12 @@ const reorderSubtopicsHandler = async (req, res, next) => {
     if (!Array.isArray(subtopics)) {
       return res
         .status(400)
-        .json({ success: false, message: 'Ordered subtopics array is required.' });
+        .json({ success: false, error: 'Ordered subtopics array is required.', code: 400 });
     }
 
     const plan = await StudyPlan.findOne({ userId: user._id, status: 'active' }).populate('examId');
     if (!plan) {
-      return res.status(404).json({ success: false, message: 'Active study plan not found.' });
+      return res.status(404).json({ success: false, error: 'Active study plan not found.', code: 404 });
     }
 
     if (plan.isLockedByTeacher && user.accountMode !== 'teacher') {
@@ -2072,7 +2103,7 @@ const reorderSubtopicsHandler = async (req, res, next) => {
             for (const top of chap.topics || []) {
               if (!topicTitle || top.title === topicTitle) {
                 top.subtopics = subtopics;
-                await plan.save();
+                await StudyPlan.findByIdAndUpdate(plan._id, { $set: { subjects: plan.subjects } });
                 return res.json({
                   success: true,
                   message: 'Subtopics reordered successfully!',
@@ -2101,84 +2132,87 @@ router.patch('/reorder-subtopics', optionalAuth, reorderSubtopicsHandler);
 router.post('/progress', optionalAuth, async (req, res, next) => {
   try {
     const { studyPlanId, increment = 1, chapterId, isCompleted } = req.body;
+
+    // Input validation: increment must be a finite number
+    const delta = Number(increment);
+    if (!isFinite(delta)) {
+      return res.status(400).json({ success: false, error: 'increment must be a valid number.', code: 400 });
+    }
+
     const user = await resolveUser(req);
 
     let plan = studyPlanId
-      ? await StudyPlan.findById(studyPlanId).populate('examId')
-      : await StudyPlan.findOne({ userId: user._id, status: 'active' }).populate('examId');
+      ? await StudyPlan.findById(studyPlanId).lean()
+      : await StudyPlan.findOne({ userId: user._id, status: 'active' }).lean();
 
     if (!plan) {
-      return res.status(404).json({ success: false, message: 'Study plan not found' });
+      return res.status(404).json({ success: false, error: 'Study plan not found', code: 404 });
     }
 
     const todayStr = getTodayDateString();
-
-    let todayLog = await DailyLog.findOne({
-      userId: user._id,
-      studyPlanId: plan._id,
-      date: todayStr,
-    });
-
-    if (!todayLog) {
-      todayLog = await DailyLog.create({
-        userId: user._id,
-        studyPlanId: plan._id,
-        date: todayStr,
-        topicsCompleted: 0,
-        timeStudiedMinutes: 0,
-      });
-    }
-
-    let delta = Number(increment) || 0;
+    let planUpdate = {};
+    let actualDelta = delta;
 
     if (chapterId) {
-      const alreadyChecked = plan.completedChapterIds.includes(chapterId);
-      if (isCompleted === true || (isCompleted === undefined && !alreadyChecked)) {
-        if (!alreadyChecked) {
-          plan.completedChapterIds.push(chapterId);
-          delta = 1;
-        } else {
-          delta = 0;
-        }
-      } else if (isCompleted === false || (isCompleted === undefined && alreadyChecked)) {
-        if (alreadyChecked) {
-          plan.completedChapterIds = plan.completedChapterIds.filter((id) => id !== chapterId);
-          delta = -1;
-        } else {
-          delta = 0;
-        }
+      const alreadyChecked = (plan.completedChapterIds || []).includes(chapterId);
+      if ((isCompleted === true || (isCompleted === undefined && !alreadyChecked)) && !alreadyChecked) {
+        planUpdate = { $addToSet: { completedChapterIds: chapterId }, $inc: { completedTopics: 1 } };
+        actualDelta = 1;
+      } else if ((isCompleted === false || (isCompleted === undefined && alreadyChecked)) && alreadyChecked) {
+        planUpdate = { $pull: { completedChapterIds: chapterId }, $inc: { completedTopics: -1 } };
+        actualDelta = -1;
+      } else {
+        actualDelta = 0;
       }
+    } else if (actualDelta !== 0) {
+      planUpdate = { $inc: { completedTopics: actualDelta } };
     }
 
-    const newTotalCompleted = Math.max(
-      0,
-      Math.min(plan.totalTopics, (plan.completedTopics || 0) + delta)
-    );
-    plan.completedTopics = newTotalCompleted;
-    await plan.save();
+    // --- ACID Transaction: Sync StudyPlan and DailyLog ---
+    const mongoose = (await import('mongoose')).default;
+    const dbSession = await mongoose.startSession();
+    dbSession.startTransaction();
 
-    todayLog.topicsCompleted = Math.max(0, todayLog.topicsCompleted + delta);
-    await todayLog.save();
+    let updatedPlan = plan;
+    let updatedLog;
+    
+    try {
+      if (Object.keys(planUpdate).length > 0) {
+        updatedPlan = await StudyPlan.findByIdAndUpdate(plan._id, planUpdate, { new: true, session: dbSession }).lean();
+      }
+
+      updatedLog = await DailyLog.findOneAndUpdate(
+        { userId: user._id, studyPlanId: plan._id, date: todayStr },
+        { $inc: { topicsCompleted: actualDelta } },
+        { new: true, upsert: true, session: dbSession }
+      ).lean();
+
+      await dbSession.commitTransaction();
+      dbSession.endSession();
+    } catch (txError) {
+      await dbSession.abortTransaction();
+      dbSession.endSession();
+      throw txError;
+    }
 
     // Invalidate in-memory target cache so next read recalculates
     const cacheKey = `target:${user._id}:${todayStr}`;
     delCache(cacheKey);
 
-    // Recalculate fresh target
-    const calculation = await calculateTodayTarget(plan);
+    const calculation = await calculateTodayTarget(updatedPlan);
     setCache(cacheKey, calculation, 3600);
 
     res.json({
       success: true,
       message: 'Progress updated successfully',
       data: {
-        todayCompleted: todayLog.topicsCompleted,
+        todayCompleted: Math.max(0, updatedLog?.topicsCompleted || 0),
         todayTarget: calculation.todayTarget,
         activeStudyDayPace: calculation.activeStudyDayPace,
-        totalCompleted: plan.completedTopics,
+        totalCompleted: updatedPlan.completedTopics,
         remainingTopics: calculation.remainingTopics,
         remainingValidDays: calculation.remainingValidDays,
-        completedChapterIds: plan.completedChapterIds,
+        completedChapterIds: updatedPlan.completedChapterIds || [],
       },
     });
   } catch (error) {
@@ -2193,61 +2227,69 @@ router.post('/progress', optionalAuth, async (req, res, next) => {
 router.post('/timer/session', optionalAuth, async (req, res, next) => {
   try {
     const { studyPlanId, timeStudiedMinutes = 0, topicsCompleted = 0 } = req.body;
+
+    // Input validation
+    const addedMinutes = Math.max(0, Math.round(Number(timeStudiedMinutes) || 0));
+    const addedTopics = Math.max(0, Math.round(Number(topicsCompleted) || 0));
+
     const user = await resolveUser(req);
 
     let plan = studyPlanId
-      ? await StudyPlan.findById(studyPlanId).populate('examId')
-      : await StudyPlan.findOne({ userId: user._id, status: 'active' }).populate('examId');
+      ? await StudyPlan.findById(studyPlanId).lean()
+      : await StudyPlan.findOne({ userId: user._id, status: 'active' }).lean();
 
     if (!plan) {
-      return res.status(404).json({ success: false, message: 'Study plan not found' });
+      return res.status(404).json({ success: false, error: 'Study plan not found', code: 404 });
     }
 
     const todayStr = getTodayDateString();
 
-    let todayLog = await DailyLog.findOne({
-      userId: user._id,
-      studyPlanId: plan._id,
-      date: todayStr,
-    });
+    // --- ACID Transaction: Sync StudyPlan and DailyLog ---
+    const mongoose = (await import('mongoose')).default;
+    const dbSession = await mongoose.startSession();
+    dbSession.startTransaction();
 
-    if (!todayLog) {
-      todayLog = await DailyLog.create({
-        userId: user._id,
-        studyPlanId: plan._id,
-        date: todayStr,
-        topicsCompleted: 0,
-        timeStudiedMinutes: 0,
-      });
-    }
+    let updatedLog;
+    let updatedPlan = plan;
 
-    const addedMinutes = Math.max(0, Math.round(Number(timeStudiedMinutes) || 0));
-    const addedTopics = Math.max(0, Math.round(Number(topicsCompleted) || 0));
+    try {
+      updatedLog = await DailyLog.findOneAndUpdate(
+        { userId: user._id, studyPlanId: plan._id, date: todayStr },
+        { $inc: { timeStudiedMinutes: addedMinutes, topicsCompleted: addedTopics } },
+        { new: true, upsert: true, session: dbSession }
+      ).lean();
 
-    todayLog.timeStudiedMinutes += addedMinutes;
-    todayLog.topicsCompleted += addedTopics;
-    await todayLog.save();
+      if (addedTopics > 0) {
+        updatedPlan = await StudyPlan.findByIdAndUpdate(
+          plan._id,
+          { $inc: { completedTopics: addedTopics } },
+          { new: true, session: dbSession }
+        ).lean();
+      }
 
-    if (addedTopics > 0) {
-      plan.completedTopics = Math.min(plan.totalTopics, (plan.completedTopics || 0) + addedTopics);
-      await plan.save();
+      await dbSession.commitTransaction();
+      dbSession.endSession();
+    } catch (txError) {
+      await dbSession.abortTransaction();
+      dbSession.endSession();
+      throw txError;
     }
 
     // Invalidate in-memory target cache
     const cacheKey = `target:${user._id}:${todayStr}`;
     delCache(cacheKey);
 
-    const calculation = await calculateTodayTarget(plan);
+    const calculation = await calculateTodayTarget(updatedPlan || plan);
     setCache(cacheKey, calculation, 3600);
 
     res.json({
       success: true,
       message: 'Focus session recorded successfully',
       data: {
-        todayCompleted: todayLog.topicsCompleted,
+        todayCompleted: updatedLog?.topicsCompleted || 0,
         todayTarget: calculation.todayTarget,
-        timeStudiedMinutes: todayLog.timeStudiedMinutes,
-        totalCompleted: plan.completedTopics,
+        timeStudiedMinutes: updatedLog?.timeStudiedMinutes || 0,
+        totalCompleted: (updatedPlan || plan).completedTopics,
         remainingTopics: calculation.remainingTopics,
         remainingValidDays: calculation.remainingValidDays,
       },
@@ -2608,8 +2650,19 @@ const editHistoryLogHandler = async (req, res, next) => {
     plan.completedChapterIds = Array.from(planCompletedSet);
     plan.completedTopics = plan.completedChapterIds.length;
 
-    await log.save();
-    await plan.save();
+    // --- ACID Transaction: Persist DailyLog + StudyPlan atomically ---
+    const txSession = await mongoose.startSession();
+    txSession.startTransaction();
+    try {
+      await log.save({ session: txSession });
+      await plan.save({ session: txSession });
+      await txSession.commitTransaction();
+      txSession.endSession();
+    } catch (txError) {
+      await txSession.abortTransaction();
+      txSession.endSession();
+      throw txError;
+    }
 
     // Invalidate caches
     const todayStr = getTodayDateString();
@@ -3423,15 +3476,23 @@ router.post('/user/heartbeat', optionalAuth, async (req, res, next) => {
 
     const { isStudying = false, activeTopicTitle = '' } = req.body || {};
 
-    user.lastHeartbeatAt = new Date();
-    user.isCurrentlyStudying = Boolean(isStudying);
-    user.currentFocusTopic = activeTopicTitle ? String(activeTopicTitle).slice(0, 80) : '';
-    await user.save();
+    // Atomic update — no fetch-mutate-save race condition
+    const updatedUser = await User.findByIdAndUpdate(
+      user._id,
+      {
+        $set: {
+          lastHeartbeatAt: new Date(),
+          isCurrentlyStudying: Boolean(isStudying),
+          currentFocusTopic: activeTopicTitle ? String(activeTopicTitle).slice(0, 80) : '',
+        },
+      },
+      { new: true, select: 'lastHeartbeatAt isCurrentlyStudying' }
+    );
 
     res.json({
       success: true,
-      lastHeartbeatAt: user.lastHeartbeatAt,
-      isCurrentlyStudying: user.isCurrentlyStudying,
+      lastHeartbeatAt: updatedUser.lastHeartbeatAt,
+      isCurrentlyStudying: updatedUser.isCurrentlyStudying,
     });
   } catch (error) {
     next(error);

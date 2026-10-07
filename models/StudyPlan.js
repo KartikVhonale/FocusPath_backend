@@ -143,17 +143,20 @@ const studyPlanSchema = new mongoose.Schema(
       default: [],
     },
     // Fast O(1) indexed list of SRS node reviews
-    nodeReviews: [
-      {
-        nodeId: { type: String, required: true },
-        title: { type: String },
-        subjectName: { type: String },
-        reviewCount: { type: Number, min: 0, default: 0 },
-        nextReviewDate: { type: Date, default: null },
-        lastReviewedAt: { type: Date, default: null },
-        timeSpentMinutes: { type: Number, min: 0, default: 0 },
-      },
-    ],
+    nodeReviews: {
+      type: [
+        {
+          nodeId: { type: String, required: true },
+          title: { type: String },
+          subjectName: { type: String },
+          reviewCount: { type: Number, min: 0, default: 0 },
+          nextReviewDate: { type: Date, default: null },
+          lastReviewedAt: { type: Date, default: null },
+          timeSpentMinutes: { type: Number, min: 0, default: 0 },
+        },
+      ],
+      default: [],
+    },
     selectedSubjects: {
       type: [String],
       default: [],
@@ -170,6 +173,7 @@ const studyPlanSchema = new mongoose.Schema(
     },
     dailyTargetHours: {
       type: Number,
+      min: 0,
       default: 4,
     },
     // Autonomous Workload Goal Engine
@@ -198,6 +202,7 @@ const studyPlanSchema = new mongoose.Schema(
     },
     estimatedHoursPerTopic: {
       type: Number,
+      min: 0,
       default: 1,
     },
     status: {
@@ -221,22 +226,25 @@ const studyPlanSchema = new mongoose.Schema(
       index: true,
     },
     // Auto-Pilot Smart Schedule: Maps specific subtopics to calendar dates
-    dailySchedule: [
-      {
-        date: { type: String, required: true }, // 'YYYY-MM-DD'
-        subtopicIds: { type: [String], default: [] },
-        subtopics: [
-          {
-            id: String,
-            title: String,
-            topicTitle: String,
-            chapterName: String,
-            subjectName: String,
-            estimatedHours: { type: Number, min: 0, default: 1 },
-          },
-        ],
-      },
-    ],
+    dailySchedule: {
+      type: [
+        {
+          date: { type: String, required: true }, // 'YYYY-MM-DD'
+          subtopicIds: { type: [String], default: [] },
+          subtopics: [
+            {
+              id: String,
+              title: String,
+              topicTitle: String,
+              chapterName: String,
+              subjectName: String,
+              estimatedHours: { type: Number, min: 0, default: 1 },
+            },
+          ],
+        },
+      ],
+      default: [],
+    },
   },
   { timestamps: true }
 );

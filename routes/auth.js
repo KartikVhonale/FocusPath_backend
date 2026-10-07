@@ -3,6 +3,7 @@ import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
 import User from '../models/User.js';
 import { protect } from '../middleware/auth.js';
+import asyncHandler from '../utils/asyncHandler.js';
 
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || 'adaptive_study_tracker_jwt_secret_key_2026';
@@ -91,172 +92,158 @@ async function formatUserResponse(user) {
 
 // @route   POST /api/auth/register or /auth/register
 // @desc    Register a new user (Self-Study, Managed, or Teacher) & return JWT token
-router.post('/register', authLimiter, async (req, res) => {
-  try {
-    const {
-      username,
-      name,
-      email,
-      password,
-      accountMode: rawMode = 'self_study',
-      teacherCode,
-      cohortNotes,
-    } = req.body;
+router.post('/register', authLimiter, asyncHandler(async (req, res) => {
+  const {
+    username,
+    name,
+    email,
+    password,
+    accountMode: rawMode = 'self_study',
+    teacherCode,
+    cohortNotes,
+  } = req.body;
 
-    if (!email || !password) {
-      return res.status(400).json({
-        success: false,
-        message: 'Please provide both email and password.',
-      });
-    }
-
-    if (password.length < 6) {
-      return res.status(400).json({
-        success: false,
-        message: 'Password must be at least 6 characters long.',
-      });
-    }
-
-    const normalizedEmail = email.toLowerCase().trim();
-    const displayName = (username || name || 'Aspirant').trim();
-
-    // Determine account mode
-    const validModes = ['self_study', 'managed', 'teacher'];
-    const accountMode = validModes.includes(rawMode) ? rawMode : 'self_study';
-
-    // Check if user already exists
-    const existingUser = await User.findOne({ email: normalizedEmail });
-    if (existingUser) {
-      return res.status(400).json({
-        success: false,
-        message: 'An account with this email address already exists. Please log in.',
-      });
-    }
-
-    let assignedTeacherId = null;
-    let finalTeacherCode = undefined;
-
-    // Managed Student Flow: Must provide valid teacher invite code
-    if (accountMode === 'managed') {
-      if (!teacherCode || !teacherCode.trim()) {
-        return res.status(400).json({
-          success: false,
-          message:
-            'Teacher Invite Code is required to join a managed class. Ask your instructor for the 6-character code.',
-        });
-      }
-
-      const cleanCode = teacherCode.trim().toUpperCase();
-      const teacher = await User.findOne({
-        accountMode: 'teacher',
-        teacherCode: cleanCode,
-      });
-
-      if (!teacher) {
-        return res.status(400).json({
-          success: false,
-          message: `Invalid Teacher Invite Code "${cleanCode}". Please verify the code with your instructor.`,
-        });
-      }
-
-      assignedTeacherId = teacher._id;
-    }
-
-    // Teacher Flow: Generate unique 6-character invite code
-    if (accountMode === 'teacher') {
-      finalTeacherCode = await getUniqueTeacherCode();
-    }
-
-    // Create user
-    const user = await User.create({
-      username: displayName,
-      email: normalizedEmail,
-      password,
-      accountMode,
-      teacherCode: finalTeacherCode,
-      assignedTeacherId,
-      cohortNotes: accountMode === 'teacher' && cohortNotes ? String(cohortNotes).trim() : '',
-    });
-
-    const token = generateToken(user._id);
-    const userPayload = await formatUserResponse(user);
-
-    setTokenCookie(res, token);
-
-    res.status(201).json({
-      success: true,
-      message:
-        accountMode === 'managed'
-          ? '🎉 Account created and linked to your instructor class!'
-          : accountMode === 'teacher'
-            ? '🎉 Instructor account created with invite code!'
-            : '🎉 Account created successfully!',
-      token,
-      user: userPayload,
-    });
-  } catch (error) {
-    console.error('Registration Error:', error);
-    res.status(500).json({
+  if (!email || !password) {
+    return res.status(400).json({
       success: false,
-      message: error.message || 'Server error during registration. Please try again.',
-      error: error.message,
+      error: 'Please provide both email and password.',
+      message: 'Please provide both email and password.',
+      code: 400,
     });
   }
-});
+
+  if (password.length < 6) {
+    return res.status(400).json({
+      success: false,
+      message: 'Password must be at least 6 characters long.',
+    });
+  }
+
+  const normalizedEmail = email.toLowerCase().trim();
+  const displayName = (username || name || 'Aspirant').trim();
+
+  // Determine account mode
+  const validModes = ['self_study', 'managed', 'teacher'];
+  const accountMode = validModes.includes(rawMode) ? rawMode : 'self_study';
+
+  // Check if user already exists
+  const existingUser = await User.findOne({ email: normalizedEmail });
+  if (existingUser) {
+    return res.status(400).json({
+      success: false,
+      message: 'An account with this email address already exists. Please log in.',
+    });
+  }
+
+  let assignedTeacherId = null;
+  let finalTeacherCode = undefined;
+
+  // Managed Student Flow: Must provide valid teacher invite code
+  if (accountMode === 'managed') {
+    if (!teacherCode || !teacherCode.trim()) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'Teacher Invite Code is required to join a managed class. Ask your instructor for the 6-character code.',
+      });
+    }
+
+    const cleanCode = teacherCode.trim().toUpperCase();
+    const teacher = await User.findOne({
+      accountMode: 'teacher',
+      teacherCode: cleanCode,
+    });
+
+    if (!teacher) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid Teacher Invite Code "${cleanCode}". Please verify the code with your instructor.`,
+      });
+    }
+
+    assignedTeacherId = teacher._id;
+  }
+
+  // Teacher Flow: Generate unique 6-character invite code
+  if (accountMode === 'teacher') {
+    finalTeacherCode = await getUniqueTeacherCode();
+  }
+
+  // Create user
+  const user = await User.create({
+    username: displayName,
+    email: normalizedEmail,
+    password,
+    accountMode,
+    teacherCode: finalTeacherCode,
+    assignedTeacherId,
+    cohortNotes: accountMode === 'teacher' && cohortNotes ? String(cohortNotes).trim() : '',
+  });
+
+  const token = generateToken(user._id);
+  const userPayload = await formatUserResponse(user);
+
+  setTokenCookie(res, token);
+
+  res.status(201).json({
+    success: true,
+    message:
+      accountMode === 'managed'
+        ? '🎉 Account created and linked to your instructor class!'
+        : accountMode === 'teacher'
+          ? '🎉 Instructor account created with invite code!'
+          : '🎉 Account created successfully!',
+    token,
+    user: userPayload,
+  });
+}));
 
 // @route   POST /api/auth/login or /auth/login
 // @desc    Authenticate user & return JWT token (Rate Limited)
-router.post('/login', authLimiter, async (req, res) => {
-  try {
-    const { email, password } = req.body;
+router.post('/login', authLimiter, asyncHandler(async (req, res) => {
+  const { email, password } = req.body;
 
-    if (!email || !password) {
-      return res.status(400).json({
-        success: false,
-        message: 'Please provide both email and password.',
-      });
-    }
-
-    const normalizedEmail = email.toLowerCase().trim();
-
-    // Find user
-    const user = await User.findOne({ email: normalizedEmail });
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid email or password.',
-      });
-    }
-
-    // Match password
-    const isMatch = await user.matchPassword(password);
-    if (!isMatch) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid email or password.',
-      });
-    }
-
-    const token = generateToken(user._id);
-    const userPayload = await formatUserResponse(user);
-
-    setTokenCookie(res, token);
-
-    res.json({
-      success: true,
-      message: 'Logged in successfully!',
-      token,
-      user: userPayload,
-    });
-  } catch (error) {
-    console.error('Login Error:', error);
-    res.status(500).json({
+  if (!email || !password) {
+    return res.status(400).json({
       success: false,
-      message: error.message || 'Server error during login. Please try again.',
-      error: error.message,
+      error: 'Please provide both email and password.',
+      message: 'Please provide both email and password.',
+      code: 400,
     });
   }
-});
+
+  const normalizedEmail = email.toLowerCase().trim();
+
+  // Find user
+  const user = await User.findOne({ email: normalizedEmail });
+  if (!user) {
+    return res.status(401).json({
+      success: false,
+      message: 'Invalid email or password.',
+    });
+  }
+
+  // Match password
+  const isMatch = await user.matchPassword(password);
+  if (!isMatch) {
+    return res.status(401).json({
+      success: false,
+      message: 'Invalid email or password.',
+    });
+  }
+
+  const token = generateToken(user._id);
+  const userPayload = await formatUserResponse(user);
+
+  setTokenCookie(res, token);
+
+  res.json({
+    success: true,
+    message: 'Logged in successfully!',
+    token,
+    user: userPayload,
+  });
+}));
 
 // @route   POST /api/auth/logout or /auth/logout
 // @desc    Clear authentication cookie

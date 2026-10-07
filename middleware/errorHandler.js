@@ -1,7 +1,7 @@
 /**
  * Production-Grade Express Error Handling Middleware
  * Scrubs sensitive database stack traces and internal query details.
- * Returns standard JSON format: { error: true, message: "Clean user-facing message", code: 400 }
+ * Returns strict JSON format: { success: false, error: "Clean user-facing message", code: 400 }
  */
 export default function errorHandler(err, req, res, next) {
   const statusCode = err.status || err.statusCode || (res.statusCode >= 400 ? res.statusCode : 500);
@@ -28,18 +28,23 @@ export default function errorHandler(err, req, res, next) {
     message = 'Your session has expired. Please log in again.';
   }
 
+  // Scrub CastError (invalid MongoDB ObjectId)
+  if (err.name === 'CastError') {
+    message = `Invalid value for field: ${err.path}.`;
+  }
+
   // Log server-side diagnostic details without exposing to user
   console.error(`🚨 [API Error] ${req.method} ${req.originalUrl || req.url}:`, {
     message: err.message,
     statusCode,
     name: err.name,
+    stack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
     timestamp: new Date().toISOString(),
   });
 
   return res.status(statusCode).json({
-    error: true,
-    message,
+    success: false,
+    error: message,
     code: statusCode,
   });
 }
-
